@@ -1,0 +1,252 @@
+# I2C to AXI4-Lite Bridge — Design Documentation
+
+## 1. Project Overview
+
+This project implements a fully synthesizable **I2C Slave to AXI4-Lite Master Bridge** in Verilog (SystemVerilog-compatible). The bridge allows any I2C master device (microcontroller, sensor hub, etc.) to access a memory-mapped AXI4-Lite fabric — reading and writing 32-bit registers over the standard 2-wire I2C bus.
+
+---
+
+## 2. File Structure
+
+```
+i2c_to_axi4lite/
+├── i2c_slave_ctrl.v          RTL: I2C Slave Controller (FSM)
+├── axi4lite_master.v         RTL: AXI4-Lite Master Controller (FSM)
+├── i2c_to_axi4lite_top.v     RTL: Top-level integration wrapper
+├── axi4lite_slave_ram.v      RTL: AXI4-Lite Slave RAM (simulation target)
+├── tb_i2c_to_axi4lite.v      Testbench (ModelSim / Questa)
+├── compile_and_sim.do        ModelSim TCL script (compile + wave setup)
+├── i2c_to_axi4lite.xdc       Vivado XDC pin constraints (Nexys A7)
+└── DESIGN_DOC.md             This document
+```
+
+---
+
+## 3. Architecture
+
+```
+                   ┌─────────────────────────────────────────────┐
+  I2C Master       │           i2c_to_axi4lite_top                │
+  (External MCU)   │                                              │
+  SCL ────────────►│  ┌─────────────────┐    ┌────────────────┐  │   AXI4-Lite
+  SDA ◄───────────►│  │  i2c_slave_ctrl │───►│ axi4lite_master│──┼──► Fabric
+                   │  │  (I2C Protocol) │    │ (AXI Protocol) │  │   (RAM/Regs)
+                   │  └─────────────────┘    └────────────────┘  │
+                   └─────────────────────────────────────────────┘
+```
+
+### 3.1 I2C Slave Controller (`i2c_slave_ctrl.v`)
+
+**Responsibilities:**
+- Synchronises SCL/SDA to system clock (2-FF synchronizer)
+- Detects START, STOP, and repeated START conditions
+- Decodes 7-bit slave address with configurable `SLAVE_ADDR` parameter
+- Deserializes incoming bytes (MSB first) and issues ACK by driving SDA low
+- Collects 4-byte AXI address + 4-byte write data (write path)
+- Drives back 4-byte read data (read path) with open-drain output enable
+- Issues one-cycle `axi_wr_req` / `axi_rd_req` pulses to the AXI master
+
+**State Machine:**
+D:/ZOHO PROJ/files/DESIGN_DOC.md
+| State | Description |
+|-------|-------------|
+| IDLE | Wait for START condition |
+| DEV_ADDR | Receive 8-bit device address (7b addr + R/W) |
+| DEV_ACK | Pull SDA low to ACK |
+| AXI_ADDR | Receive 4 bytes of AXI address (MSB first) |
+| AXI_ADDR_ACK | ACK each address byte |
+| WR_DATA | Receive 4 bytes of write data |
+| WR_ACK | ACK each data byte |
+| AXI_WR | Pulse wr_req, wait for wr_done |
+| AXI_RD | Pulse rd_req, wait for rd_done |
+| RD_DATA | Shift out 4 bytes of read data |
+| RD_ACK | Sample ACK/NACK from master |
+
+### 3.2 AXI4-Lite Master Controller (`axi4lite_master.v`)
+
+**Responsibilities:**
+- Executes AXI4-Lite write and read transactions
+- Handles all 5-channel handshake (AWVALID/AWREADY, WVALID/WREADY, BVALID/BREADY, ARVALID/ARREADY, RVALID/RREADY)
+- 16-bit timeout counter prevents bus lockup
+- Returns OKAY/ERROR status to the I2C controller
+
+**State Machine:**
+
+| State | Description |
+|-------|-------------|
+| IDLE | Wait for cmd_wr_req or cmd_rd_req |
+| WR_ADDR | Drive AWVALID, wait for AWREADY handshake |
+| WR_DATA | Drive WVALID, wait for WREADY handshake |
+| WR_RESP | Assert BREADY, wait for BVALID + check BRESP |
+| RD_ADDR | Drive ARVALID, wait for ARREADY handshake |
+| RD_DATA | Assert RREADY, wait for RVALID + capture RDATA |
+
+---
+
+## 4. I2C Frame Protocol
+
+### Write Transaction
+
+```
+[S][DEV_ADDR+W][A][AXI_A3][A][AXI_A2][A][AXI_A1][A][AXI_A0][A]
+   [DATA_B3][A][DATA_B2][A][DATA_B1][A][DATA_B0][A][P]
+
+S  = START condition (SDA falls while SCL high)
+A  = ACK (DUT drives SDA=0)
+P  = STOP condition (SDA rises while SCL high)
+W  = 0 (write bit)
+```
+
+### Read Transaction
+
+```
+Phase 1 - Send address:
+[S][DEV_ADDR+W][A][AXI_A3][A][AXI_A2][A][AXI_A1][A][AXI_A0][A]
+
+Phase 2 - Read data (repeated start):
+[RS][DEV_ADDR+R][A][DATA_B3][A][DATA_B2][A][DATA_B1][A][DATA_B0][N][P]
+
+RS = Repeated START
+N  = NACK (master drives SDA=1 on last byte)
+R  = 1 (read bit)
+```
+
+---
+
+## 5. Simulation Instructions (ModelSim / Questa)
+
+### Step-by-Step
+
+```bash
+# 1. Open ModelSim
+# 2. Change to project directory
+cd /path/to/i2c_to_axi4lite
+
+# 3. Run the compile & simulate script
+do compile_and_sim.do
+```
+
+### What to Observe
+
+The waveform window will show all 6 test cases in sequence:
+
+| Test Case | I2C Operation | AXI Address | Data Written | Expected Read |
+|-----------|--------------|-------------|--------------|---------------|
+| TC1 | Write | 0x00000004 | 0xDEADBEEF | — |
+| TC2 | Read | 0x00000004 | — | 0xDEADBEEF |
+| TC3 | Write | 0x00000008 | 0xCAFEBABE | — |
+| TC4 | Read | 0x00000008 | — | 0xCAFEBABE |
+| TC5 | Write+Read | 0x00000000 | 0x12345678 | 0x12345678 |
+| TC6 | BB Writes + Reads | 0x10, 0x14 | 0xABCD1234, 0x5678EFAB | Same |
+
+### Expected Console Output
+
+```
+==========================================================
+ I2C to AXI4-Lite Bridge Simulation
+ Slave Address: 0x50 | System Clock: 100 MHz
+==========================================================
+
+[TC1] Write 0xDEADBEEF to AXI addr 0x00000004
+TB [xxxxx] I2C WRITE: addr=0x00000004 data=0xDEADBEEF
+
+[TC2] Read back from AXI addr 0x00000004
+TB [xxxxx] I2C READ:  addr=0x00000004
+  READ result: 0xDEADBEEF
+  [PASS] TC2 ReadBack: got=0xDEADBEEF expected=0xDEADBEEF
+
+...
+
+==========================================================
+ SIMULATION COMPLETE
+ PASS: 6  |  FAIL: 0
+==========================================================
+ ALL TESTS PASSED ✓
+```
+
+---
+
+## 6. FPGA Implementation (Xilinx Vivado)
+
+### Target Board
+Digilent **Nexys A7-100T** (Artix-7 XC7A100T)
+
+### Steps
+
+1. Open Vivado → Create Project → RTL Project
+2. Add sources: `i2c_slave_ctrl.v`, `axi4lite_master.v`, `i2c_to_axi4lite_top.v`
+3. Add constraint file: `i2c_to_axi4lite.xdc`
+4. Set top module: `i2c_to_axi4lite_top`
+5. Configure slave address parameter (default: `7'h50`)
+6. Run Synthesis → Implementation → Generate Bitstream
+7. Program device via JTAG
+
+### Resource Utilization (Estimated, Artix-7)
+
+| Resource | Estimated Usage |
+|----------|----------------|
+| LUT | ~180 |
+| FF | ~150 |
+| BRAM | 0 |
+| DSP | 0 |
+| IOB | 4 (SCL, SDA_I, SDA_O, SDA_OE) |
+
+### Hardware Test Setup
+
+```
+   PC/Arduino           FPGA Board (Nexys A7)
+   (I2C Master)         ┌─────────────────────┐
+       │                │  PMOD JA             │
+   SCL ─────────────────►  JA1 (SCL)           │
+   SDA ◄────────────────►  JA2 (SDA_I/SDA_O)  │
+   GND ─────────────────►  GND                 │
+                        └─────────────────────┘
+   (4.7kΩ pull-ups to 3.3V on SCL and SDA)
+```
+
+> **Note:** For open-drain I2C, connect SDA_O → SDA_OE → external NMOS,
+> or use a tri-state buffer: `assign SDA_PAD = sda_oe ? 1'b0 : 1'bz;`
+
+---
+
+## 7. Design Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `SLAVE_ADDR` | 7'h50 | 7-bit I2C device address |
+| `TIMEOUT_VAL` | 16'd65535 | AXI timeout in clock cycles |
+| `MEM_DEPTH` | 256 | Slave RAM depth (words) |
+
+---
+
+## 8. Standards Compliance
+
+- **I2C:** Conforms to NXP I²C-bus specification (UM10204), Rev. 7, 2021
+  - Standard mode (100 kHz) and Fast mode (400 kHz) compatible
+  - 7-bit addressing
+  - Open-drain SDA with ACK/NACK signaling
+- **AXI4-Lite:** Conforms to ARM IHI0022F (AMBA AXI and ACE Protocol Specification)
+  - All 5 channels implemented
+  - OKAY (2'b00) and SLVERR (2'b10) response handling
+  - Separate read and write data channels
+
+---
+
+## 9. Known Limitations & Future Improvements
+
+1. **Clock stretching** not implemented (I2C master must not use it)
+2. **10-bit I2C addressing** not supported
+3. **AXI burst transfers** not supported (AXI4-Lite only)
+4. **Clock domain crossing**: SCL/SDA use 2-FF synchronizers; for large clock
+   frequency ratios, consider Gray-code FIFOs for command handoff
+5. **Multiple slaves**: `SLAVE_ADDR` is static; runtime address matching
+   could be added via a register interface
+
+---
+
+## 10. References
+
+1. NXP Semiconductors, *UM10204 I2C-bus specification and user manual*, Rev. 7, 2021
+2. ARM, *AMBA AXI and ACE Protocol Specification*, IHI0022F, 2013
+3. Xilinx/AMD, *Vivado Design Suite User Guide: Programming and Debugging*, UG908
+4. Xilinx/AMD, *AXI Reference Guide*, UG761
